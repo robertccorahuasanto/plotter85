@@ -42,7 +42,8 @@ body.collapsed .grid > div:nth-child(2){display:none}
 .heatmap-ctx-select:hover{border-color:#3b5072}
 .sim-slider-key{background:#0f1a30;border:1px solid #2c426c;border-radius:4px;padding:1px 5px;font-weight:700;letter-spacing:.05em;color:#34d399}
 .sim-slider-label input[type=range]{width:80px;accent-color:#34d399}
-#simHRVal{font-weight:700;color:#34d399;min-width:42px;text-align:right}
+#simHRVal{font-weight:700;color:#34d399;min-width:42px;text-align:right;padding:2px 6px;border-radius:4px;transition:background .15s;user-select:none}
+#simHRVal:hover{background:rgba(52,211,153,.12)}
 .twin-menu-dropdown{position:absolute;top:100%;right:0;margin-top:4px;background:#0f1a30;border:1px solid #2c426c;border-radius:8px;padding:6px;min-width:240px;z-index:100;box-shadow:0 8px 22px rgba(0,0,0,.5)}
 .record-menu-dropdown{position:absolute;top:100%;left:0;margin-top:4px;background:#0f1a30;border:1px solid #2c426c;border-radius:8px;padding:6px;min-width:280px;z-index:100;box-shadow:0 8px 22px rgba(0,0,0,.5);max-height:60vh;overflow-y:auto}
 .record-menu-dropdown .group-title{font-size:.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;padding:6px 6px 2px;border-bottom:1px dashed #243553;margin-bottom:2px}
@@ -358,11 +359,11 @@ details.collapsible[open]>summary::after{content:' ▴'}
       <div class="plot-title">
         <span>Beat template — your twin's reference beat</span>
         <span style="display:flex;gap:6px;align-items:center">
-          <label class="sim-slider-label" title="Simulate predicted beat at any HR — the green prediction line will show what your beat looks like at the chosen HR rather than your current HR.">
+          <span class="sim-slider-label" title="Simulate predicted beat at any HR — the green prediction line will show what your beat looks like at the chosen HR rather than your current HR.">
             <span class="sim-slider-key">SIM</span>
             <input id="simHRSlider" type="range" min="40" max="140" step="1" value="0" />
             <span id="simHRVal">live</span>
-          </label>
+          </span>
           <span class="badge" id="templateBadge">0 beats</span>
         </span>
       </div>
@@ -1986,10 +1987,17 @@ function openRecordMenu(){
   for (const a of RECORD_ANCHOR_STATES){
     const btn = document.createElement('button');
     btn.className = 'opt';
-    btn.innerHTML = `<span><span class="anchor-icon">🧭</span> ${a.label}</span><span class="dur">${a.dur}s · 5s countdown</span>`;
+    // If this anchor already exists, show its instance count
+    const existing = listContexts().find(c => c.isAnchor && c.label === a.label);
+    const dur = existing ? `${a.dur}s · ${existing.instances.length} instance${existing.instances.length===1?'':'s'} · ${existing.status}` : `${a.dur}s · 5s countdown`;
+    btn.innerHTML = `<span><span class="anchor-icon">🧭</span> ${a.label}</span><span class="dur">${dur}</span>`;
     btn.addEventListener('click', () => {
       dd.style.display = 'none';
-      confirmRecord(a.label, { isAnchor: true, recommendedDur: a.dur, color: a.color, defaultCountdown: true });
+      // Reuse existing anchor context if present so each calibration becomes
+      // a new INSTANCE (1/3 → 2/3 → 3/3), not a new duplicate context.
+      const opts = { isAnchor: true, recommendedDur: a.dur, color: a.color, defaultCountdown: true };
+      if (existing) opts.existingId = existing.id;
+      confirmRecord(a.label, opts);
     });
     dd.appendChild(btn);
   }
@@ -2043,7 +2051,10 @@ function openRecordMenu(){
     if (e.key === 'Enter' && txt.value.trim()){
       const lbl = txt.value.trim().slice(0, 40);
       dd.style.display = 'none';
-      confirmRecord(lbl, {});
+      // Reuse existing context (case-insensitive match on label) if present
+      const existing = listContexts().find(c => c.label.toLowerCase() === lbl.toLowerCase());
+      const opts = existing ? { existingId: existing.id, color: existing.color } : {};
+      confirmRecord(existing ? existing.label : lbl, opts);
     }
   });
   dd.appendChild(txt);
@@ -2483,23 +2494,50 @@ function contextStabilityExpectation(c){
 // signature drift in cognitive directions, anchored to YOUR contextual
 // baseline. Cognitive interpretations are the user's, not the device's.
 const COGLOAD_EMA_ALPHA = 0.05;     // very slow smoothing — cognitive states evolve over tens of seconds
-const COGLOAD_MOTION_GATE = 0.92;   // beat stability < this = treat as motion, suppress
-const COGLOAD_CONF_GATE = 0.45;     // active context confidence < this = suppress
+// Gate thresholds calibrated for marginal-discrimination hardware (the
+// honest reality of single-lead chest/finger ECG). They were originally
+// too strict — kept the indicator at "no data" for users whose classifier
+// confidence honestly hovers around 25-30% with marginal context separation.
+const COGLOAD_MOTION_GATE = 0.85;
+const COGLOAD_CONF_GATE = 0.22;
 state.cogLoadIndex = null;
 state.cogLoadComponents = null;
 state.cogLoadHistory = [];          // [{t, value}] for short trace if we ever add a chart
 
-function updateCognitiveLoadIndex(beat, hr){
-  // Gate 1: need an active context with cognitive features
-  const ac = state.activeContextId ? state.contexts[state.activeContextId] : null;
-  if (!ac || !ac.cogvasFeatures){
-    state.cogLoadIndex = null; state.cogLoadComponents = null; return;
+// Backfill cogvasFeatures for legacy contexts that pre-date the field.
+// Computes T-amplitude from the context's averaged template; LF/HF and
+// stability remain null (not enough info from the template alone).
+function backfillContextCogvas(ctx){
+  if (ctx.cogvasFeatures && ctx.cogvasFeatures.tAmplitude != null) return;
+  if (!ctx.template) return;
+  const tAmp = computeTAmplitude(ctx.template);
+  if (!ctx.cogvasFeatures) ctx.cogvasFeatures = {};
+  if (ctx.cogvasFeatures.tAmplitude == null && tAmp != null){
+    ctx.cogvasFeatures.tAmplitude = tAmp;
   }
-  // Gate 2: classifier must be confident
+}
+
+function updateCognitiveLoadIndex(beat, hr){
+  // Gate 1: need an active context. Backfill cog features from template if missing.
+  const ac = state.activeContextId ? state.contexts[state.activeContextId] : null;
+  if (!ac){
+    state.cogLoadIndex = null;
+    state.cogLoadComponents = { gated: 'no active context' };
+    return;
+  }
+  if (!ac.cogvasFeatures || ac.cogvasFeatures.tAmplitude == null){
+    backfillContextCogvas(ac);
+  }
+  if (!ac.cogvasFeatures){
+    state.cogLoadIndex = null;
+    state.cogLoadComponents = { gated: 'context "'+ac.label+'" has no cardiac fingerprint yet' };
+    return;
+  }
+  // Gate 2: classifier confidence
   const conf = state.contextProbs[state.activeContextId] || 0;
   if (conf < COGLOAD_CONF_GATE){
     state.cogLoadIndex = null;
-    state.cogLoadComponents = { gated: 'low confidence ('+(conf*100).toFixed(0)+'%)' };
+    state.cogLoadComponents = { gated: 'classifier uncertain ('+(conf*100).toFixed(0)+'% on '+ac.label+')', conf };
     return;
   }
   // Gate 3: motion check — use the same liveBeatStability the classifier already computes
@@ -2513,7 +2551,7 @@ function updateCognitiveLoadIndex(beat, hr){
   // ----- Component 1: T-wave amplitude depression (signed) -----
   // ratio < 1 = T flattened (sympathetic shift); ratio > 1 = T raised
   let tComp = null;
-  if (ac.cogvasFeatures.tAmplitude != null && ac.cogvasFeatures.tAmplitude > 0.02){
+  if (ac.cogvasFeatures.tAmplitude != null && ac.cogvasFeatures.tAmplitude > 0.005){
     const liveT = computeTAmplitude(beat);
     if (liveT != null && liveT > 0){
       const ratio = liveT / ac.cogvasFeatures.tAmplitude;
@@ -2551,9 +2589,9 @@ function updateCognitiveLoadIndex(beat, hr){
   if (tComp != null) comps.push({w:0.45, v:tComp, name:'T-wave'});
   if (rmssdComp != null) comps.push({w:0.40, v:rmssdComp, name:'RMSSD'});
   if (lateComp != null) comps.push({w:0.15, v:lateComp, name:'late-repol'});
-  if (comps.length < 2){
+  if (comps.length === 0){
     state.cogLoadIndex = null;
-    state.cogLoadComponents = { gated: 'insufficient components ('+comps.length+'/3)' };
+    state.cogLoadComponents = { gated: 'no measurable components', conf, stab };
     return;
   }
   let raw = 0, totalW = 0;
@@ -5057,7 +5095,11 @@ function acceptShiftLabel(label, existingId){
   if (existingId && state.contexts[existingId]){
     ctx = state.contexts[existingId];
   } else {
-    ctx = createContext(label, {});
+    // If a context with this label already exists (case-insensitive),
+    // attach to it instead of creating a duplicate.
+    const dup = listContexts().find(c => c.label.toLowerCase() === label.toLowerCase());
+    if (dup) ctx = dup;
+    else ctx = createContext(label, {});
   }
   // Push the captured beats into the context
   for (const b of q.beats){
@@ -6234,7 +6276,11 @@ function init(){
     }
   }
   els.simHRSlider.addEventListener('input', refreshSimHRStyle);
-  els.simHRVal.addEventListener('click', () => {
+  els.simHRVal.addEventListener('click', (e) => {
+    // Stop the parent <label> from forwarding the click to the slider input,
+    // which was preventing our reset from taking effect.
+    e.preventDefault();
+    e.stopPropagation();
     if (Number(els.simHRSlider.value) > 0){
       els.simHRSlider.value = 0;
       refreshSimHRStyle();
