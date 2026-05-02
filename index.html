@@ -640,6 +640,7 @@ const state = {
   contextProbsHistory:[],       // [{t, probs:{contextId→0..1}}] rolling history for the inference strip
   lastClassifierComponents:null,// stores per-feature scores for the last classified beat (debugging / UI)
   heatmapContextChoice:'active',// 'active' = follow live classifier, or contextId to lock
+  simHRLocked:null,             // null = follow live HR, or a number = locked SIM HR
   shiftDetector:{lastShiftAt:null, queue:[], baselineHR:null, baselineRMSSD:null, baselineMorphSim:null},
   pendingShiftQuery:null,       // shift detected, waiting for user label
   bookmarks:[],
@@ -1245,6 +1246,84 @@ function computeMorphStability(beats){
   for (let i=0;i<BEAT_LEN;i++) mean[i] /= n;
   const sims = beats.map(b => cosineSim(b, mean)).sort((a,b) => a-b);
   return sims[Math.floor(sims.length/2)];
+}
+
+// Merge duplicate-labeled contexts into a single one, preserving all
+// instances. Anchors merge with anchors; non-anchors merge with non-anchors.
+// The "winner" is whichever context has the most instances; the others are
+// folded in (template = weighted average, hrModel = weighted average, all
+// instances accumulated). Returns count of merges performed.
+function dedupeContexts(){
+  const groups = {};   // key: 'a:label' or 'u:label' (anchor vs user)
+  for (const id in state.contexts){
+    const c = state.contexts[id];
+    const key = (c.isAnchor ? 'a:' : 'u:') + c.label.toLowerCase();
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(c);
+  }
+  let merged = 0;
+  for (const key in groups){
+    const group = groups[key];
+    if (group.length < 2) continue;
+    // Pick winner: highest templateCount, ties broken by oldest createdAt
+    group.sort((a,b) => {
+      if (b.templateCount !== a.templateCount) return b.templateCount - a.templateCount;
+      return (a.createdAt || '').localeCompare(b.createdAt || '');
+    });
+    const winner = group[0];
+    for (let i=1; i<group.length; i++){
+      const loser = group[i];
+      // Merge templates (weighted average)
+      if (loser.template && winner.template){
+        const wN = winner.templateCount || 1;
+        const lN = loser.templateCount || 1;
+        const total = wN + lN;
+        for (let k=0;k<BEAT_LEN;k++){
+          winner.template[k] = (winner.template[k]*wN + loser.template[k]*lN) / total;
+        }
+        winner.templateCount = Math.min(200, total);
+      } else if (loser.template && !winner.template){
+        winner.template = loser.template.slice();
+        winner.templateCount = loser.templateCount;
+      }
+      // Merge hrModel
+      if (loser.hrModel){
+        if (!winner.hrModel) winner.hrModel = makeEmptyHRModel();
+        for (let k=0;k<HR_BINS;k++){
+          const lt = loser.hrModel.templates[k], wt = winner.hrModel.templates[k];
+          const ln = loser.hrModel.eff_n[k] || 0, wn = winner.hrModel.eff_n[k] || 0;
+          if (lt && wt){
+            const total = wn + ln;
+            for (let i=0;i<BEAT_LEN;i++){
+              wt[i] = (wt[i]*wn + lt[i]*ln) / total;
+            }
+            winner.hrModel.eff_n[k] = Math.min(200, total);
+          } else if (lt && !wt){
+            winner.hrModel.templates[k] = lt.slice();
+            winner.hrModel.eff_n[k] = ln;
+          }
+        }
+      }
+      // Merge instances
+      winner.instances = (winner.instances || []).concat(loser.instances || []);
+      // Update lastSeen to most recent of the two
+      if (loser.lastSeen && (!winner.lastSeen || loser.lastSeen > winner.lastSeen)){
+        winner.lastSeen = loser.lastSeen;
+      }
+      // If active was the loser, switch to winner
+      if (state.activeContextId === loser.id) state.activeContextId = winner.id;
+      delete state.contexts[loser.id];
+      merged++;
+    }
+    // Recompute baseline HRV from the now-merged instance list
+    rebuildContextBaselineHRV(winner);
+    // If winner has ≥3 instances and was learning, graduate it
+    if (winner.status === 'learning' && (winner.instances || []).length >= 3){
+      winner.status = 'inferring';
+    }
+  }
+  if (merged > 0) state.twinDirty = true;
+  return merged;
 }
 
 // Sync the global state.template/state.hrModel/state.baseline pointers to
@@ -3953,9 +4032,12 @@ function drawTemplate(){
   if (state.template) buf.push(...state.template);
   const recent = state.beats.slice(-25);
   for (const b of recent) buf.push(...b.v);
-  // Resolve which HR to predict at: simulator override or live current HR.
-  const simHR = els.simHRSlider ? Number(els.simHRSlider.value) : 0;
-  const useSimMode = simHR > 0;
+  // Resolve which HR to predict at: simulator override (state.simHRLocked
+  // when non-null) or live current HR. The slider element is just a UI
+  // control — the source of truth is state.simHRLocked, which can be cleared
+  // by clicking "live" without conflicting with the slider's min=40 clamp.
+  const simHR = state.simHRLocked;
+  const useSimMode = simHR != null && simHR > 0;
   const liveHR = state.hrv && state.hrv.hr ? state.hrv.hr : (recent.length ? recent[recent.length-1].hr : null);
   const targetHR = useSimMode ? simHR : liveHR;
   let pred = null;
@@ -4918,8 +5000,21 @@ function syncHeatmapContextSelect(){
 function renderContextsList(){
   if (!els.contextsList) return;
   const ctxs = listContexts();
+  // Detect duplicate-label contexts (same label, same isAnchor)
+  const labelCounts = {};
+  for (const c of ctxs){
+    const key = (c.isAnchor ? 'a:' : 'u:') + c.label.toLowerCase();
+    labelCounts[key] = (labelCounts[key] || 0) + 1;
+  }
+  const nDup = Object.values(labelCounts).filter(n => n > 1).length;
   if (els.contextsCount){
-    els.contextsCount.textContent = ctxs.length === 0 ? '— none yet' : `· ${ctxs.length} known`;
+    if (ctxs.length === 0){
+      els.contextsCount.textContent = '— none yet';
+    } else if (nDup > 0){
+      els.contextsCount.innerHTML = `· ${ctxs.length} known · <a href="#" id="contextsMergeLink" style="color:#fbbf24;text-decoration:underline">merge ${nDup} duplicate${nDup===1?'':'s'}</a>`;
+    } else {
+      els.contextsCount.textContent = `· ${ctxs.length} known`;
+    }
   }
   if (ctxs.length === 0){
     els.contextsList.innerHTML = '<em class="contexts-empty">Click <strong>Record ▾</strong> in the topbar to capture a labeled context. Anchor states (supine/standing/seated) appear at the top of the menu.</em>';
@@ -5011,6 +5106,19 @@ function renderContextsList(){
       }
     });
     els.contextsList.appendChild(item);
+  }
+  // Wire the merge-duplicates link if present
+  const mergeLink = document.getElementById('contextsMergeLink');
+  if (mergeLink){
+    mergeLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      const merged = dedupeContexts();
+      if (merged > 0){
+        setStatus(`✓ Merged ${merged} duplicate context${merged===1?'':'s'}`, 'ok');
+        syncActiveContext();
+        renderContextsList();
+      }
+    });
   }
 }
 function humanTimeAgo(iso){
@@ -6256,14 +6364,15 @@ function init(){
     }
   });
   els.driftRecalBtn.addEventListener('click', () => startCalibration());
-  // Simulation slider: dragging changes which HR the predicted beat shows.
-  // Value 0 = "live" (use current HR). The simHRVal text doubles as a
-  // toggle — clicking it returns to live mode. Brighter color when in
-  // live mode so it's clearly the active state.
+  // Simulation slider: source of truth is state.simHRLocked.
+  // - null = live (follow current HR)
+  // - number = locked at that HR
+  // Slider is just a UI input — the user dragging it sets simHRLocked,
+  // clicking "live" clears it. We can't rely on slider.value=0 because
+  // browsers clamp to min=40, which made the previous reset silently fail.
   function refreshSimHRStyle(){
-    const v = Number(els.simHRSlider.value);
-    if (v > 0){
-      // Override active — show the value, dim the slider track
+    const v = state.simHRLocked;
+    if (v != null && v > 0){
       els.simHRVal.textContent = `${v} bpm · click to live`;
       els.simHRVal.style.color = '#fde68a';
       els.simHRVal.style.cursor = 'pointer';
@@ -6275,20 +6384,21 @@ function init(){
       els.simHRVal.title = 'Drag the slider to lock prediction at a specific HR';
     }
   }
-  els.simHRSlider.addEventListener('input', refreshSimHRStyle);
+  els.simHRSlider.addEventListener('input', () => {
+    // User dragged the slider — lock to that HR
+    state.simHRLocked = Number(els.simHRSlider.value);
+    refreshSimHRStyle();
+  });
   els.simHRVal.addEventListener('click', (e) => {
-    // Stop the parent <label> from forwarding the click to the slider input,
-    // which was preventing our reset from taking effect.
     e.preventDefault();
     e.stopPropagation();
-    if (Number(els.simHRSlider.value) > 0){
-      els.simHRSlider.value = 0;
+    if (state.simHRLocked != null){
+      state.simHRLocked = null;
       refreshSimHRStyle();
     }
   });
-  // Double-click anywhere on the slider track also resets to live
   els.simHRSlider.addEventListener('dblclick', () => {
-    els.simHRSlider.value = 0;
+    state.simHRLocked = null;
     refreshSimHRStyle();
   });
   refreshSimHRStyle();
