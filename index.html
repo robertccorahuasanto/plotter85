@@ -180,7 +180,7 @@ input[type=checkbox]{transform:scale(1.2)}
 .plot-card{padding:4px 5px 5px}
 .plot-title{font-size:.74rem;font-weight:700;margin:0 3px 3px;display:flex;justify-content:space-between;align-items:center;gap:5px}
 .plot-title .badges{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-.plot-title .badge{font-size:.72rem;color:var(--muted);font-weight:500;background:#1a2540;border:1px solid #2c426c;padding:2px 8px;border-radius:999px}
+.plot-title .badge{font-size:.72rem;color:var(--muted);font-weight:500;background:#1a2540;border:1px solid #2c426c;padding:2px 8px;border-radius:999px;white-space:nowrap}
 .plot-title .badge.q{display:inline-flex;align-items:center;gap:5px}
 .plot-title .badge.q::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--qg);display:inline-block}
 .plot-title .badge.q.marginal::before{background:var(--qm)}
@@ -2491,8 +2491,13 @@ function findMatchingContext(beats){
 // Only flips active context when one beats the runner-up by a clear margin
 // to avoid thrashing.
 const CLF_EMA_ALPHA = 0.20;     // smoothing of context probabilities
-const CLF_DOMINANT_MIN = 0.55;  // top probability must exceed this to switch
-const CLF_DOMINANT_MARGIN = 0.15; // and must lead second-place by this much
+// Originally 0.55 / 0.15 — too high for marginal-discrimination hardware,
+// where "winning at 28%" is the user's normal-confident state. Lowered to
+// 0.22 / 0.05 so the active context actually flips when the classifier
+// honestly identifies a transition. (See cogLoad gates which are similarly
+// calibrated to real-world confidence levels.)
+const CLF_DOMINANT_MIN = 0.22;
+const CLF_DOMINANT_MARGIN = 0.05;
 
 // =============================================================
 //   MULTI-FEATURE CONTEXT CLASSIFIER
@@ -2812,7 +2817,12 @@ function updateLiveContextClassification(beat, hr){
   // not in a recording (recordings already write to their own context),
   // gently update its templates. This is the "twin keeps learning after
   // graduation" property.
-  if (!state.recording && top[1] >= 0.85){
+  // Threshold lowered from 0.85 (which never triggered on marginal-
+  // discrimination hardware) to a more realistic 0.30 with a strict margin
+  // requirement. The margin protects against poisoning: passive learning
+  // only fires when ONE context is clearly winning over runners-up, even
+  // if its absolute probability is modest.
+  if (!state.recording && top[1] >= 0.30 && (top[1] - second[1]) >= 0.10){
     const ctx = state.contexts[top[0]];
     if (ctx && ctx.status === 'inferring'){
       pushBeatToContext(ctx, beat, hr);
@@ -4155,7 +4165,7 @@ function drawHRHeatmap(){
       for (let i=0;i<BEAT_LEN;i++) allVals.push(M.templates[k][i]);
     }
   }
-  if (els.hrHeatmapBadge) els.hrHeatmapBadge.textContent = `${coveredBins} / ${HR_BINS}${pickedLabel ? ' · '+pickedLabel : ''}`;
+  if (els.hrHeatmapBadge) els.hrHeatmapBadge.textContent = `${coveredBins} / ${HR_BINS} bins`;
   if (allVals.length === 0){
     ctx.fillStyle = C.axis; ctx.font = '12px system-ui';
     ctx.fillText('No beats accumulated yet.', left+10, top+ph/2);
